@@ -1,0 +1,598 @@
+---
+params:
+  UnitCode: "PIRO"
+  UnitName: "Pictured Rocks National Lakeshore"
+# GBIF key to access data. Use "new" for to run a new GBIF query. 
+  Key: "new"
+  repull: TRUE
+  localBounds: TRUE # use cached boundary if present
+title: "Existing Freshwater Mussel Occurrence Records for\n `r params$UnitName`"
+author:
+  - name:  "Jessica Joganic"
+    affiliation:  NPS Midwest Regional Office
+  - name: "Tom Philippi" 
+    affiliation: IMD Species Inventory Program
+  - name:  "Brenda Lafrancois"
+    affiliation:  NPS Midwest Regional Office
+  - name:  "Lisa Nelson"
+    affiliation: IMD Species Inventory Program
+  - name: "Matthew Van Scoyoc" 
+    affiliation: IMD Species Inventory Program
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+---
+
+```{r setup, eval=TRUE, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#-- Global settings
+options(timeout = 600)
+gc() # Call a garbage collection to free up memory
+
+ 
+#-- Packages
+# R packages used in this script
+pkgLst <- c("dplyr",       # data management
+            "glue",        # text string editing
+            "ggplot2",     # plotting/graphing
+            "here",        # navigating directories
+            "htmltools",   # tools for HTML generation and output
+            "htmlwidgets", # more html tools
+            "jsonlite",    # JSON parser
+            "kableExtra",  # table formatting
+            "knitr",       # Markdown formatting
+            "rmarkdown",   # for render()
+            "distill",     # for extended YAML
+            "leaflet",     # spatial rendering
+            "lubridate",   # dating
+            "readr",       # writing TSV files
+            "rgbif",       # retrieve data from GBIF
+            "rgdal",       # geospatial data functions
+            "sf",          # spatial functions
+            "taxadb",      # taxa name validation
+            "tibble",      # data structures
+            "tidyr")       # data management
+
+#-- Install
+# Install packages if they aren't in your library
+instPkgs <- pkgLst %in% rownames(installed.packages())
+if (any(instPkgs == FALSE)) {
+  install.packages(pkgLst[!instPkgs], 
+                   lib =  .libPaths()[1], 
+                   repos = "https://cloud.r-project.org",
+                   type = 'source', 
+                   dependencies = TRUE, 
+                   quiet = TRUE)
+}
+
+# Load packages into work space
+# Note: This script is written so the packages do not need to be loaded.
+#     Comment out the next line if you want to supress loading packages.
+invisible(lapply(pkgLst, library, character.only = TRUE))
+
+#-- knitr
+# Set global options for RMarkdown
+knitr::opts_chunk$set(eval = TRUE, 
+                      echo = FALSE, 
+                      results = 'hide', 
+                      comment = "",
+                      message=FALSE, 
+                      warning=FALSE,
+                      fig.path = "Figures/",
+                      tidy = TRUE, 
+                      tidy.opts = list(width.cutoff = 60), 
+                      cache = FALSE)
+
+
+#-- ggplot2 theme
+ggplot2::theme_set(ggplot2::theme_bw())
+ggplot2::theme_update(plot.title = ggplot2::element_text(hjust = 0.5))
+sppPage <- 40
+
+UnitCode <- params$UnitCode
+repull <- params$repull
+key <- params$Key
+
+gbif_crs <- 4326  # crs of downloaded GBIF records
+
+if (!file.exists("gtmp")) dir.create("gtmp")
+
+#-- eBird details
+eBirdChecklistURL <- "https://www.birds.cornell.edu/clementschecklist/wp-content/uploads/2021/08/eBird-Clements-v2021-integrated-checklist-August-2021.csv"
+
+eBirdChecklistFile <- file.path(
+  "..", 
+  "Taxa Lists",
+  "eBird-Clements-v2021-integrated-checklist-August-2021.csv"
+  )
+```
+
+```{r functions}
+#' Collapse conservation lists
+#' This function filters a conservation list and collapses the status and TSN so 
+#'     there is one observation per species name.
+#'
+#' @param conservList A dataframe of the conservation list of interest
+#' @param speciesList A vector of species names to filter the conservation list
+#'
+#' @return A dataframe of 3 variables:
+#'     - ProtectedSci: Species name from conservation list
+#'     - MatchListStatus: Collapsed conservation status
+#'     - ProtectedTSN: Collapsed taxonomic serial number (TSN)
+#'
+#' @examples collpaseList(fedList, speciesList$scientificName_gbif)
+collpaseList <- function(conservDF, speciesList){
+  conservDF = conservDF |> 
+    dplyr::filter(!is.na(taxonID) & taxonID %in% speciesList)
+  newDF <- conservDF |> 
+    dplyr::select(taxonID, MatchListStatus) |> 
+    dplyr::distinct() |> 
+    dplyr::group_by(taxonID) |> 
+    dplyr::summarise(MatchListStatus = toString(MatchListStatus)) |> 
+    merge({conservDF |> 
+            dplyr::select(taxonID, ProtectedTSN) |> 
+            dplyr::distinct() |> 
+            dplyr::group_by(taxonID) |> 
+            dplyr::summarise(ProtectedTSN = toString(ProtectedTSN))}, 
+          by = "taxonID", all = TRUE)
+  return(newDF)
+}
+
+#' Download park boundary feature classes
+#' This function retrieves NPS boundaries from NPS online data sources that are
+#'     updated quarterly.
+#'
+#' @param UnitCode 4-character park unit code. Typically from params$UnitCode. 
+#' @param aoaExtent Extent of area to be downloaded. The default is npsBound. 
+#'     Options include the following:
+#'     \itemize{
+#'         \item \emph{park}: The park area of analysis (AOA); essentially the 
+#'             park boundary.
+#'         \item \emph{km3}: 3 km buffer AOA around the park AOA.
+#'             See \code{\link{import_daily}} for details.
+#'         \item \emph{km30}: 30 km buffer AOA around the park AOA.
+#'         \item \emph{npsBound}: The most up-to-date NPS park unit boundary 
+#'             polygon.
+#'         \item \emph{npsTract}: The most up-to-date NPS unit tract polygon.
+#'     }  
+#' @param lifecycle The lifecycle of the data.
+#'
+#' @return An sf object, polygon
+#' 
+#' @examples getBoundFeature(params$UnitCode, aoaExtent = "npsBounds")
+getBoundFeature <- function(UnitCode, aoaExtent="npsBound", lifecycle = "Active") {
+  tempOutput <- file.path("temp.geojson")
+  featureServiceURLs <-
+    list("park" = "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/IMD_BND_ALL_UNITS_park_AOA_nad_py/FeatureServer/0", #park AOAs
+         "km3" = "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/IMD_BND_ALL_UNITS_3km_AOA_nad_py/FeatureServer/1", # 3km AOAs
+         "km30" = "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/IMD_BND_ALL_UNITS_30km_AOA_nad_py/FeatureServer/2", # 30km AOAs
+         "npsBound" = "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/NPS_Land_Resources_Division_Boundary_and_Tract_Data_Service/FeatureServer/2", # NPS unit boundary polygons, updated quarterly
+         "npsTract" = "https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/NPS_Land_Resources_Division_Boundary_and_Tract_Data_Service/FeatureServer/1" #NPS unit tract polygons, updated quarterly
+         )
+  
+  # Request feature in WGS83 spatial reference (outSR=4326)
+  if (aoaExtent == 'npsBound' | aoaExtent == 'npsTract') {
+    featureServicePathInfo <- paste0('query?where=UNIT_CODE+%3D+%27', UnitCode,
+                                   '%27&outFields=*&returnGeometry=true&outSR=4326&f=pjson')
+  }
+  else {
+    featureServicePathInfo <- paste0('query?where=UNITCODE+%3D+%27', UnitCode,
+                                   '%27&outFields=*&returnGeometry=true&outSR=4326&f=pjson')
+  }
+  featureServiceRequest <- paste(featureServiceURLs[[aoaExtent]],
+                                 featureServicePathInfo, sep = "/" )
+  print(featureServiceRequest)
+  geoJSONFeature <- jsonlite::fromJSON(featureServiceRequest)
+  
+  # Have to save to temp file
+  jsonFeature <- download.file(featureServiceRequest, tempOutput, mode = "w")
+  # For rgdal 1.2+, layer (format) does not need to be specified
+  featurePoly <- sf::st_read(dsn = tempOutput)
+  # featurePoly <- readOGR(dsn = tempOutput)
+  
+  #featurePoly <- readOGR(dsn = tempOutput, layer = "OGRGeoJSON")
+  return(featurePoly)
+}
+
+#' Glue vector
+#' This function returns a string of text with comma's between each value.
+#'
+#' @param v A vector of numbers or characters.
+#'
+#' @return A string of comma separated values.
+#'
+#' @examples glueVector(month.abb)
+glueVector <- function(v) {
+  if (length(v) == 1){
+    as.character(v)
+  } else if (length(v) == 2){
+    glue::glue("{v[1]} and {v[2]}")
+  } else {
+    glue::glue("{paste(v[1:length(v) - 1], collapse = ', ')}, and {v[length(v)]}")
+  }
+}
+
+#' Custom table
+#' This function uniformly formats tables for this Rmd. 
+#'
+#' @param myTable A dataframe.
+#' @param col_names A vector of column names.
+#' @param caption A sting of the caption.
+#'
+#' @return A kableExtra:kbl object.
+#'
+#' @examples 
+#' myTable(sppTable,
+#'         col_names = c("Kingdom", "Phylum", "Class", "Number of Species"),
+#'         caption = "Number of species by Class observed in the Park")
+myTable <- function(myTable, col_names, caption){
+  kableExtra::kbl(myTable, col.names = col_names, caption = caption) |> 
+  kableExtra::kable_styling(full_width = FALSE,
+                            bootstrap_options = c("striped", "bordered",
+                                                  "condensed")) |> 
+  kableExtra::kable_paper("hover") |>
+  kableExtra::kable_minimal()
+}
+
+#' Create a WTK string
+#' Creates a well-known text string from a polygon (sf object).
+#'
+#' @param myPolygon An sf polygon.
+#'
+#' @return A WTK string.
+#'
+#' @examples wtkString(aoaPark)
+#' 
+wtkString <- function(myPolygon){
+  sf::st_bbox(myPolygon) |> 
+    sf::st_as_sfc() |> 
+    sf::st_as_text()
+}
+
+```
+
+
+```{r taxa_lists}
+GBIF_mussel_orders <- c(9574493, 3247005, 9301143, 9310756, 841)
+
+
+```
+
+
+
+
+# Overview
+
+This script pulls species records for `r params$ParkName` from the Global Biodiversity Information Facility (GBIF) resource using R (ver. `r paste(sessionInfo()$R.version$major, sessionInfo()$R.version$minor, sep=".")`, R Core Team 2022) and the rgbif package (ver. `r sessionInfo()$otherPkgs$rgbif$Version`, Chamberlain & Mcglinn 2022).
+This script will retrieve species records from GBIF in Darwin Core Archive format.
+
+The data from GBIF are species occurrence records from museum collections, academic studies, and citizen science programs.
+The level of search effort is often not recorded in these data and therefore it is not appropriate to use these data to estimate species abundance or trends over time.
+Furthermore, while most of these data contain spatial coordinates, they often do not include spatial precision metrics.
+
+## Area of Analyses
+
+Three tiers of area will be examined in this script: 1) the park boundary, 2) a 3 km buffer outside the park boundary, and 3) a second from 3 km to 30 km buffer outside the park boundary.
+This approach provides three tiers of species occurrence data: 1) species that have been recorded in the park, 2) species that likely occur in the park but have not been recorded in the park, and 3) species that occur near the park that have not been recorded in the park.
+
+```{r getAOA}
+# NPS Park Tiles for map background:
+tileURL  <- 'https://atlas-stg.geoplatform.gov/styles/v1/atlas-user/ck58pyquo009v01p99xebegr9/tiles/256/{z}/{x}/{y}@2x?access_token=pk.eyJ1IjoiYXRsYXMtdXNlciIsImEiOiJjazFmdGx2bjQwMDAwMG5wZmYwbmJwbmE2In0.lWXK2UexpXuyVitesLdwUg&'
+
+bCacheName <- paste0("bounds_", params$UnitCode, ".Rdata")
+
+if (params$localBounds & file.exists(bCacheName)) {
+    load(bCacheName)
+} else {
+  # Pull area of analysis features
+  aoaPark <- getBoundFeature(UnitCode = params$UnitCode, aoaExtent = "park")
+  aoa3k <- getBoundFeature(UnitCode = params$UnitCode, aoaExtent = "km3")
+  aoa30k <- getBoundFeature(UnitCode = params$UnitCode, aoaExtent = "km30")
+  # Set CRS
+  if(sf::st_crs(aoaPark) == sf::st_crs(aoa30k)) {
+    crs <- sf::st_crs(aoa30k)
+  } else {
+    message("aoaPark was used to set the CRS")
+    crs <- sf::st_crs(aoaPark)
+  }
+  # save a local copy in case testing needs to be off the vpn
+  save(aoaPark, aoa3k, aoa30k, file = bCacheName)
+} # bottom if else localBounds
+```
+
+```{r aoakMap, results='hold', eval = TRUE}
+#-- Map
+# Map with NPS Park Tiles basemap
+mapTitle <- htmltools::tags$div(
+  htmltools::HTML(
+    sprintf("%s: Area of Analysis - %s", 
+            params$UnitName, 
+            "park (blue), km3 (red), & km30 (black)")
+    )
+  )
+
+aoaMap <- leaflet::leaflet() |> 
+  leaflet::addTiles(urlTemplate = tileURL) |>  
+  leaflet::addPolylines(data = aoaPark$geometry, label = aoaPark$UnitName, 
+                        color = "blue", weight = 3, opacity = 1) |> 
+  leaflet::addPolylines(data = aoa3k$geometry, label = aoa3k$UnitName, 
+                        color = "red", weight = 3, opacity = 1) |> 
+  leaflet::addPolylines(data = aoa30k$geometry, label = aoa30k$UnitName, 
+                        color = "black", weight = 3, opacity = 1)
+htmltools::tagList(aoaMap |> 
+                     leaflet::addControl(mapTitle, position = "topright"))
+# environment()
+```
+
+# Download Records from GBIF
+
+GBIF records requests are staged on the GBIF servers and have to be downloaded.
+See [Getting Occurrence Data From GBIF](https://docs.ropensci.org/rgbif/articles/getting_occurrence_data.html) for details.
+This script submits a records request to GBIF using the 30 km AOA to spatially query GBIF records. 
+The data are downloaded, unzipped, and the data are read in to R once the request is available from GBIF.
+
+Note that this use of GBIF requires a (free) username and password.  As per the documentation for rgbif::occ_dowload(), these values are assigned to variables gbif_user, gbif_pwd, and gbif_email in Rprofile.site.  If you are attempting to run this script yourself, you need to obtain a username and password and put them in your .Rprofile.site file via assign statements to the .GlobalEnv environment:
+assign("gbif_user", 'tephilippi', envir = .GlobalEnv)
+etc.
+
+```{r pullGBIF}
+# Make bounding boxes for AOA extents
+# wtkPark <- wtkString(aoaPark)
+# wtk3k <- wtkString(aoa3k)
+wtk30k <- wtkString(aoa30k)
+
+
+
+#-- Pull data from GBIF
+if (!(file.exists(UnitCode)) | repull) {   # do a new pull
+   gpred <-  rgbif::pred_and(rgbif::pred_in("taxonKey", GBIF_mussel_orders),
+								            rgbif::pred_within(wtk30k)
+	  							          )
+   gbifDwnld <- rgbif::occ_download(pred = gpred, 
+                                   format = "DWCA", 
+                                   user = gbif_user,
+                                   pwd = gbif_pwd,
+                                   email = gbif_email)
+  
+    rgbif::occ_download_wait(gbifDwnld)
+    
+    if (!file.exists(UnitCode)) dir.create(UnitCode)
+    gbif <- rgbif::occ_download_get(gbifDwnld, path = UnitCode) |>
+            rgbif::occ_download_import(path = "gtmp") |> 
+            dplyr::mutate(date = as.Date(eventDate, "%Y-%m-%d"), 
+                          dayOfYear = lubridate::yday(date))
+    key <- gbifDwnld
+    
+} else {
+  if (!file.exists(UnitCode)) dir.create(UnitCode)
+  if (key == "new") {
+     xx <- list.files(path = UnitCode, pattern = "^.*\\.zip$")
+     key <- sub(".zip", "", xx[1], fixed = TRUE)
+   } 
+   gbif <- rgbif::occ_download_import(rgbif::as.download(paste0(UnitCode, "/", key, ".zip")),
+                                      path = "gtmp") |> 
+            dplyr::mutate(date = as.Date(eventDate, "%Y-%m-%d"), 
+                          dayOfYear = lubridate::yday(date))
+
+
+} # do a new pull
+
+```
+
+`r nrow(gbif)` records were downloaded with `r ncol(gbif)` fields of data.
+All records have scientific names and spatial data.
+Most of the records do not contain spatial uncertainty or precision data.
+`r sum(is.na(gbif$eventDate))` records are missing valid dates.
+These data span `r min(gbif$year, na.rm = TRUE)` to `r max(gbif$year, na.rm = TRUE)`.
+
+```{r exploreGBIF, results='hold'}
+# Count NA's by selected column
+kableExtra::kbl(t(dplyr::select(gbif, scientificName, species,
+                              acceptedScientificName, verbatimScientificName, 
+                              decimalLatitude, decimalLongitude, 
+                              coordinateUncertaintyInMeters, 
+                              coordinatePrecision, eventDate) |> 
+                  dplyr::summarise_all(function(x) sum(is.na(x)))), 
+                col.names = "Number of missing values",
+                caption = "Missing values in species names, spatial and temporal fields.") |> 
+  kableExtra::kable_styling(full_width = FALSE,
+                            bootstrap_options = c("bordered", "condensed")) |> 
+  kableExtra::kable_paper("hover") |>
+  kableExtra::kable_minimal()
+```
+
+```{r spatial}
+# Convert tabular data to spatial data and clip to 30km AOA.
+gbif_sf <- sf::st_as_sf(gbif, 
+                        coords = c("decimalLongitude", "decimalLatitude"),
+                        crs = gbif_crs) |> 
+  sf::st_intersection(aoa30k) |> 
+  dplyr::select(names(gbif[, 1]):names(gbif[, length(gbif)]), geometry)
+
+# Test if spatial data are valid
+validGBIF <- unique(sf::st_is_valid(sf::st_as_sf(gbif_sf)))
+
+# There is certainly a more elegant way to do this, but this works for now.
+
+gbif_sf$locale <- "km30"
+gbif_sf$locale[as.logical(sf::st_intersects(gbif_sf, aoa3k))] <- "km3"
+gbif_sf$locale[as.logical(sf::st_intersects(gbif_sf, aoaPark))] <- "park"
+
+gbif_sf$locale <- factor(gbif_sf$locale, levels = c("park", "km3", "km30"))
+table(gbif_sf$locale)
+#with(gbif_sf, table(scientificName, locale))
+
+
+
+sf::st_write(gbif_sf, 
+             dsn = paste0(UnitCode, "/", UnitCode, "_mussels.gpkg"),
+             layer = "GBIF_mussels", append = FALSE)
+sf::st_write(aoaPark, 
+             dsn = paste0(UnitCode, "/", UnitCode, "_mussels.gpkg"), append = FALSE,
+             layer = "Park_Boundary")
+sf::st_write(aoa3k, 
+             dsn = paste0(UnitCode, "/", UnitCode, "_mussels.gpkg"), 
+             layer = "AOA_3km", append = FALSE)
+sf::st_write(aoa30k, 
+             dsn = paste0(UnitCode, "/", UnitCode, "_mussels.gpkg"),
+             layer = "AOA_30km", append = FALSE)
+
+
+# Remove gbif to free up memory
+rm(gbif)
+```
+
+```{r localeTables}
+# Locations
+localeTbl <- as.data.frame(table(gbif_sf$locale))
+
+# Record types
+typesTable <- sf::st_drop_geometry(gbif_sf) |> 
+  dplyr::filter(taxonRank  %in% c("SPECIES", "SUBSPECIES") & 
+                  locale %in% c('park')) |> 
+  dplyr::select(basisOfRecord, gbifID) |>
+  dplyr::distinct() |> 
+  dplyr::group_by(basisOfRecord) |> 
+  dplyr::count(basisOfRecord, name = 'gbifID_n')
+
+instituteTable <- sf::st_drop_geometry(gbif_sf) |> 
+  dplyr::filter(taxonRank  %in% c("SPECIES", "SUBSPECIES") & 
+                  locale %in% c('park')) |> 
+  dplyr::select(institutionCode, gbifID) |>
+  dplyr::distinct() |> 
+  dplyr::group_by(institutionCode) |> 
+  dplyr::count(institutionCode, name = 'gbifID_n')
+
+# Species per Class
+sppTable <- sf::st_drop_geometry(gbif_sf) |> 
+  dplyr::filter(taxonRank %in% c("SPECIES", "SUBSPECIES") & 
+                  locale %in% c('park')) |> 
+  dplyr::select(kingdom:genus, verbatimScientificName) |>
+  dplyr::distinct() |> 
+  dplyr::group_by(kingdom, phylum) |> 
+  dplyr::count(class, name = 'species_n')
+
+# Records per class
+recordsTable <- sf::st_drop_geometry(gbif_sf) |> 
+  dplyr::filter(taxonRank %in% c("SPECIES", "SUBSPECIES") & 
+                  locale %in% c('park')) |> 
+  dplyr::select(kingdom:genus, gbifID) |>
+  dplyr::distinct() |> 
+  dplyr::group_by(kingdom, phylum) |> 
+  dplyr::count(class, name = 'observations')
+
+
+
+
+# Species by locale
+sppLocaleTable <-sf::st_drop_geometry(gbif_sf) |>
+  dplyr::count(scientificName, locale, .drop = FALSE) |>
+  tidyr::spread(locale, n) 
+sppLocaleTable[is.na(sppLocaleTable)] <- 0
+
+
+
+splist <- sf::st_drop_geometry(gbif_sf)[,c("species", "verbatimScientificName",
+                                       "locality", "locale", "eventDate", "basisOfRecord", 
+                                      "institutionCode", "collectionCode")]
+splist <- splist[order(splist$species, splist$eventDate),]
+write.csv(splist, file = paste0(UnitCode, "/", UnitCode, "_splist.csv"), row.names = FALSE)
+
+
+
+
+```
+
+The geometry is `r ifelse(isTRUE(validGBIF), "valid", "not valid")` when the GBIF data were converted to a spatial object.
+There are `r localeTbl[localeTbl$Var1 == 'park', 2]` species records with the park boundary, another `r localeTbl[localeTbl$Var1 == 'km3', 2]` records within 3km of the boundary, and `r localeTbl[localeTbl$Var1 == 'km30', 2]` more between 3km and 30km of the boundary.
+Records were obtained from `r nrow(typesTable)` collections or observational data types.
+Records were obtained form `r nrow(instituteTable)` sources (e.g., museums or data repositories).
+
+```{r printTables1, results='hold'}
+myTable(localeTbl,
+        col_names = c("Location", "GBIF Records"),
+        caption = "Number of GBIF records by AOA areas")
+
+if (localeTbl$Freq[1] > 0) {
+myTable(typesTable, 
+        col_names = c("Record Types", "GBIF Records"), 
+        caption = "Number of GBIF records by record type observed in the Park")
+
+myTable(sppTable, 
+        col_names = c("Kingdom", "Phylum", "Class", "Number of Species"),
+        caption = "Number of species by Class observed in the Park")
+
+myTable(recordsTable, 
+        col_names = c("Kingdom", "Phylum", "Class", "GBIF Records"),
+        caption = "Number of GBIF records by Class observed in the Park")
+} # only if any occur in the park
+myTable(sppLocaleTable,
+        col_names = c("Scientific Name", "in Park", "within 3km", "within 30km"),
+        caption = paste0("Counts of Occurrence Records in and near\n",
+                         params$UnitName))
+
+
+
+
+```
+
+
+```{r genReport, eval = FALSE}
+parm <- params
+save(sppList, parm, file = "tmpxxx.Rmd")
+# generate the summary report from the ugTemplate.Rmd file (which loads tmpxxx.Rmd)
+rmarkdown::render(input = "ugTemplate.Rmd",
+                  output_format = "html",
+                  output_file = paste0("Summary_Report_for_", params$UnitCode), ".html")
+
+```
+
+# Citations
+
+Chamberlain S, Barve V, Mcglinn D, Oldoni D, Desmet P, Geffert L, Ram K (2022). 
+  rgbif: Interface to the Global Biodiversity Information Facility API. 
+  R package version 3.7.2,
+  <https://CRAN.R-project.org/package=rgbif>.
+  
+
+
+
+Kari E. A. Norman, Scott Chamberlain, and Carl Boettiger (2020).
+  taxadb: A high-performance local taxonomic database interface. 
+  Methods in Ecology and Evolution, 11(9), 1153-1159.
+  doi:10.1111/2041-210X.13440.
+
+Kinseth, M and L. Nelson (2022).
+  Boundary-derived Areas of Analysis for National Park Service Units, Fall 2021.
+  NPS/NRSS/DRR---2022/3.
+  <https://irma.nps.gov/DataStore/Reference/Profile/2287628>.
+
+National Park Service Inventory and Monitoring Division (NPS-IMD; 2021).
+  National Park Service NRSS Inventory and Monitoring Division (IMD) Management 
+  Areas Inventory Data Services.
+  National Park Service Data Store
+  <https://irma.nps.gov/DataStore/Reference/Profile/2286496>.
+
+National Park Service Inventory and Monitoring Division (NPS-IMD; 2022).
+  NPS Unit Boundary-derived Areas of Analysis, Fall 2021.
+  National Park Service Data Store.
+  <https://irma.nps.gov/DataStore/Reference/Profile/2287631>.
+
+R Core Team (2022). R: A language and environment for statistical
+  computing. R Foundation for Statistical Computing, Vienna, Austria. URL
+  <https://www.R-project.org/>.
+
+# Session
+
+This report was generated on `r lubridate::now()`. 
+R session information is printed below.
+
+```{r session, results='hold'}
+sessionInfo()
+```
+
+```{r saveData, eval = FALSE}
+save(gbif_sf, sppList, file = "sppPull.RData")
+```

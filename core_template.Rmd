@@ -1,0 +1,108 @@
+---
+params:
+  ghDate: "`r Sys.Date() - 2`" # default to ~curent versions
+title: "Base TEmplate for\n `r params$UnitName`"
+author:
+  - name: "Tom Philippi" 
+    affiliation: IMD Species Inventory Program
+  - name:  "Lisa Nelson"
+    affiliation: IMD Species Inventory Program
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+---
+
+```{r setup, eval=TRUE, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#-- Global settings
+options(timeout = 600)
+gc() # Call a garbage collection to free up memory
+
+ 
+#-- Packages
+# R packages used in this script
+pkgLst <- c("dplyr",       # data management
+            "report",      # automated citations
+            "glue",        # text string editing
+            "ggplot2",     # plotting/graphing
+            "here",        # navigating directories
+            "kableExtra",  # table formatting
+            "knitr",       # Markdown formatting
+            "rmarkdown",   # for render()
+            "distill",     # for extended YAML
+            "lubridate",   # dating
+            "readr",       # writing TSV files
+            "tibble",      # data structures
+            "tidyr")       # data management
+
+#-- Install
+if (!"groundhog" %in% installed.packages()) install.packages("groundhog")
+
+# n.b.: groundhog.install() does not like the current date as the date, 
+# because CRANS update with uneven latency.  Therefore, the default value
+# of params$ghDate is 2 days before the current date (when the script is running).
+groundhog::groundhog.library(pkgLst, date = params$ghDate)
+
+# create citations for R packages
+# this is here for visibility in the template.  It should be re-run at the bottom
+# in case additional packages are added along the way.
+citelist <- report::cite_packages(include_R = TRUE)  #|>
+#  report::clean_citation()
+
+
+#-- knitr
+# Set global options for RMarkdown
+knitr::opts_chunk$set(eval = TRUE, 
+                      echo = FALSE, 
+                      results = 'hide', 
+                      comment = "",
+                      message=FALSE, 
+                      warning=FALSE,
+                      fig.path = "Figures/",
+                      tidy = TRUE, 
+                      tidy.opts = list(width.cutoff = 60), 
+                      cache = FALSE)
+
+
+#-- ggplot2 theme
+ggplot2::theme_set(ggplot2::theme_bw())
+ggplot2::theme_update(plot.title = ggplot2::element_text(hjust = 0.5))
+sppPage <- 40
+
+
+```
+
+# Citations
+
+`r report::clean_citation(report::cite_packages(include_R = TRUE)`
+
+Kinseth, M and L. Nelson (2022).
+  Boundary-derived Areas of Analysis for National Park Service Units, Fall 2021.
+  NPS/NRSS/DRR---2022/3.
+  <https://irma.nps.gov/DataStore/Reference/Profile/2287628>.
+
+National Park Service Inventory and Monitoring Division (NPS-IMD; 2021).
+  National Park Service NRSS Inventory and Monitoring Division (IMD) Management 
+  Areas Inventory Data Services.
+  National Park Service Data Store
+  <https://irma.nps.gov/DataStore/Reference/Profile/2286496>.
+
+National Park Service Inventory and Monitoring Division (NPS-IMD; 2022).
+  NPS Unit Boundary-derived Areas of Analysis, Fall 2021.
+  National Park Service Data Store.
+  <https://irma.nps.gov/DataStore/Reference/Profile/2287631>.
+
+R Core Team (2022). R: A language and environment for statistical
+  computing. R Foundation for Statistical Computing, Vienna, Austria. URL
+  <https://www.R-project.org/>.
+
+# Session
+
+This report was generated on `r lubridate::now()`. 
+R session information is printed below.
+
+```{r session, results='hold'}
+sessionInfo()
+```
